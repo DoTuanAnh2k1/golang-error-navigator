@@ -22,6 +22,14 @@
       {
         "command": "golang-error-navigator.parseTerminalError",
         "title": "Parse Terminal Error"
+      },
+      {
+        "command": "golang-error-navigator.processClipboard",
+        "title": "Process Go Errors from Clipboard"
+      },
+      {
+        "command": "golang-error-navigator.toggleClipboardMonitoring", 
+        "title": "Toggle Go Error Clipboard Monitoring"
       }
     ],
     "menus": {

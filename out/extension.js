@@ -38,13 +38,17 @@ exports.deactivate = deactivate;
 const vscode = __importStar(require("vscode"));
 const fs = __importStar(require("fs"));
 const path = __importStar(require("path"));
+// ============= 🌍 GLOBAL VARIABLES =============
+let clipboardWatcher;
+let lastClipboardContent = '';
+let statusBarItem;
 // ============= 🚀 MAIN ACTIVATION FUNCTION =============
 /**
  * 🎯 Function chính - được gọi khi extension khởi động
  * VSCode sẽ tự động call cái này
  */
 function activate(context) {
-    console.log('🔥🔥🔥 GOLANG ERROR NAVIGATOR STARTING! 🔥🔥🔥');
+    console.log('🔥🔥🔥 GOLANG ERROR NAVIGATOR STARTING WITH EXTERNAL TERMINAL SUPPORT! 🔥🔥🔥');
     console.log('📅 Activation time:', new Date().toISOString());
     // === 📋 ĐĂNG KÝ CÁC PROVIDERS ===
     console.log('📋 Registering providers...');
@@ -55,7 +59,6 @@ function activate(context) {
             console.log('🔍 HOVER TRIGGERED!');
             console.log('📄 Document:', document.fileName);
             console.log('📍 Position:', position.line, position.character);
-            // 🔥 GỌI FUNCTION MỚI SUPPORT ERROR CHAIN SPLIT
             return provideErrorHoverWithChainSplit(document, position);
         }
     });
@@ -80,22 +83,33 @@ function activate(context) {
             handleTerminalErrorLink(link);
         }
     });
-    // 5️⃣ Event listener khi terminal thay đổi
+    // 🔥 5️⃣ EXTERNAL TERMINAL SUPPORT - Process clipboard errors
+    const processClipboardCommand = vscode.commands.registerCommand('golang-error-navigator.processClipboard', async () => {
+        console.log('🎮 Manual clipboard processing triggered!');
+        await processClipboardManually();
+    });
+    // 🔥 6️⃣ Toggle clipboard monitoring
+    const toggleClipboardMonitoring = vscode.commands.registerCommand('golang-error-navigator.toggleClipboardMonitoring', () => {
+        toggleClipboardWatcher();
+    });
+    // 7️⃣ Event listener khi terminal thay đổi
     vscode.window.onDidChangeActiveTerminal(terminal => {
         if (terminal) {
             console.log('📺 Active terminal changed:', terminal.name);
         }
     });
+    // 🔥 8️⃣ Setup external terminal support
+    setupExternalTerminalSupport(context);
     // 📝 Đăng ký tất cả với VSCode để manage lifecycle
-    context.subscriptions.push(hoverProvider, navigateCommand, parseTerminalCommand, terminalLinkProvider);
+    context.subscriptions.push(hoverProvider, navigateCommand, parseTerminalCommand, terminalLinkProvider, processClipboardCommand, toggleClipboardMonitoring);
     console.log('✅ Extension fully activated and registered!');
-    console.log('🎉 Ready to rock! Hover over error messages to test!');
+    console.log('🎉 Ready to rock! Hover over error messages or copy from external terminal!');
 }
 // ============= ✂️ ERROR CHAIN SPLITTING FUNCTIONS =============
 /**
  * 🔥 SPLIT ERROR CHAIN THEO DẤU ":"
- * Input: "request failed: handling user creation: creating user: db insert: duplicate key"
- * Output: ["request failed", "handling user creation", "creating user", "db insert", "duplicate key"]
+ * Input: "error: store failed: disk full"
+ * Output: ["error", "store failed", "disk full"]
  */
 function splitErrorChain(errorMessage) {
     console.log('✂️ === SPLITTING ERROR CHAIN ===');
@@ -118,17 +132,6 @@ function splitErrorChain(errorMessage) {
             console.log(`❌ Skipped part too short: "${part}"`);
         }
     });
-    // Thêm cumulative chains (optional - để match tốt hơn) - BỎ QUA BƯỚC NÀY
-    // VÌ NÓ TẠO RA QUาาԱ NHIỀU NOISE!
-    console.log('🚫 Skipping cumulative chains to avoid noise');
-    /*
-    for (let i = 0; i < parts.length - 1; i++) {
-        const cumulativeChain = parts.slice(0, i + 2).join(': ');
-        if (cumulativeChain.length > 10 && cumulativeChain.length < 100) {
-            chains.push(cumulativeChain);
-        }
-    }
-    */
     // Xóa duplicate và sort theo độ dài (ngắn trước cho UX tốt hơn)
     const uniqueChains = [...new Set(chains)].sort((a, b) => a.length - b.length);
     console.log('🎯 Final chains:', uniqueChains);
@@ -142,18 +145,18 @@ function splitErrorChain(errorMessage) {
 async function provideErrorHoverWithChainSplit(document, position) {
     console.log('🔥 === NEW HOVER SESSION WITH CHAIN SPLIT ===');
     const line = document.lineAt(position);
-    // const lineText = line.text;
+    const lineText = line.text;
     // 🔥 ENHANCED: Lấy toàn bộ line thay vì chỉ word để detect error chains
     const lineRange = line.range;
-    const lineText = line.text.trim();
+    const fullLineText = line.text.trim();
     // Nếu line có dấu ":" thì lấy toàn bộ line, nếu không thì lấy word
     let wordRange;
     let exactText;
-    if (lineText.includes(':') && lineText.split(':').length > 1) {
+    if (fullLineText.includes(':') && fullLineText.split(':').length > 1) {
         // Đây có thể là error chain - lấy toàn bộ line
         console.log('🔗 Potential error chain detected, using full line');
         wordRange = lineRange;
-        exactText = lineText;
+        exactText = fullLineText;
     }
     else {
         // Fallback: lấy word range như cũ
@@ -165,10 +168,6 @@ async function provideErrorHoverWithChainSplit(document, position) {
             return null;
         }
         exactText = document.getText(wordRange);
-    }
-    if (!wordRange) {
-        console.log('❌ No word range found at cursor position');
-        return null;
     }
     if (!wordRange) {
         console.log('❌ No word range found at cursor position');
@@ -236,41 +235,81 @@ async function findAllErrorLocations(exactText) {
         }
     }
     // Sort theo relevance (similarity score cao nhất trước)
-    allMatches.sort((a, b) => (b.similarity || 0) - (a.similarity || 0));
-    console.log(`📊 Found ${allMatches.length} total matches for "${exactText}"`);
-    return allMatches.slice(0, 10); // Giới hạn 10 results thôi
+    allMatches.sort((a, b) => {
+        const scoreA = a.similarity || 0;
+        const scoreB = b.similarity || 0;
+        // Primary sort: by similarity (higher first)
+        if (scoreB !== scoreA) {
+            return scoreB - scoreA;
+        }
+        // Secondary sort: by line number (lower first, closer to top of file)
+        return a.line - b.line;
+    });
+    console.log(`📊 Found ${allMatches.length} total matches for "${exactText}" (sorted by relevance)`);
+    return allMatches.slice(0, 10);
 }
 /**
  * 🔍 TÌM EXACT TEXT TRONG 1 FILE CỤ THỂ
  */
-async function findExactTextInFile(filePath, exactText) {
-    console.log(`🔍 Searching for "${exactText}" in ${path.basename(filePath)}`);
+// async function findExactTextInFile(filePath: string, exactText: string): Promise<ErrorLocation[]> {
+//     console.log(`🔍 Searching for "${exactText}" in ${path.basename(filePath)}`);
+//     const matches: ErrorLocation[] = [];
+//     try {
+//         // Đọc file content
+//         const content = await fs.promises.readFile(filePath, 'utf8');
+//         const lines = content.split('\n');
+//         // Duyệt qua từng dòng
+//         for (let i = 0; i < lines.length; i++) {
+//             const line = lines[i];
+//             // Kiểm tra exact string match (case insensitive)
+//             if (line.toLowerCase().includes(exactText.toLowerCase())) {
+//                 console.log(`✅ EXACT MATCH at line ${i + 1}: "${line.trim()}"`);
+//                 // Tính similarity score dựa trên context
+//                 let similarity = 0.7; // Base score
+//                 // Bonus nếu có fmt.Errorf hoặc errors.New
+//                 if (line.includes('fmt.Errorf') || line.includes('errors.New')) {
+//                     similarity += 0.2;
+//                 }
+//                 // Bonus nếu có return statement
+//                 if (line.trim().startsWith('return')) {
+//                     similarity += 0.1;
+//                 }
+//                 matches.push({
+//                     file: filePath,
+//                     line: i + 1,
+//                     similarity: Math.min(similarity, 1.0),
+//                     description: `Contains: "${exactText}"`
+//                 });
+//             }
+//         }
+//     } catch (error) {
+//         console.log(`⚠️ Error reading ${path.basename(filePath)}:`, error);
+//     }
+//     console.log(`📊 Found ${matches.length} matches in ${path.basename(filePath)}`);
+//     return matches;
+// }
+// ============= 🎨 HOVER UI CREATION FUNCTIONS =============
+async function findExactTextInFile(filePath, searchText) {
+    console.log(`🧠 Smart searching for "${searchText}" in ${path.basename(filePath)}`);
     const matches = [];
     try {
-        // Đọc file content
         const content = await fs.promises.readFile(filePath, 'utf8');
         const lines = content.split('\n');
-        // Duyệt qua từng dòng
+        // 🔥 SMART PATTERN GENERATION - KHÔNG HARDCODE!
+        const searchPatterns = generateSmartPatterns(searchText);
+        console.log('🎯 Smart patterns:', searchPatterns.slice(0, 5), '...');
         for (let i = 0; i < lines.length; i++) {
             const line = lines[i];
-            // Kiểm tra exact string match (case insensitive)
-            if (line.toLowerCase().includes(exactText.toLowerCase())) {
-                console.log(`✅ EXACT MATCH at line ${i + 1}: "${line.trim()}"`);
-                // Tính similarity score dựa trên context
-                let similarity = 0.7; // Base score
-                // Bonus nếu có fmt.Errorf hoặc errors.New
-                if (line.includes('fmt.Errorf') || line.includes('errors.New')) {
-                    similarity += 0.2;
-                }
-                // Bonus nếu có return statement
-                if (line.trim().startsWith('return')) {
-                    similarity += 0.1;
-                }
+            const lowerLine = line.toLowerCase();
+            // Tính similarity cho từng pattern
+            const bestMatch = findBestMatch(searchText, line, searchPatterns);
+            if (bestMatch.score >= 0.8) { // Chỉ lấy ≥ 80%
+                console.log(`✅ SMART MATCH at line ${i + 1}: "${line.trim()}" (${(bestMatch.score * 100).toFixed(0)}%)`);
                 matches.push({
                     file: filePath,
                     line: i + 1,
-                    similarity: Math.min(similarity, 1.0),
-                    description: `Contains: "${exactText}"`
+                    similarity: bestMatch.score,
+                    description: `Smart match: "${bestMatch.pattern}"`
                 });
             }
         }
@@ -278,10 +317,101 @@ async function findExactTextInFile(filePath, exactText) {
     catch (error) {
         console.log(`⚠️ Error reading ${path.basename(filePath)}:`, error);
     }
-    console.log(`📊 Found ${matches.length} matches in ${path.basename(filePath)}`);
+    console.log(`📊 Found ${matches.length} smart matches in ${path.basename(filePath)}`);
     return matches;
 }
-// ============= 🎨 HOVER UI CREATION FUNCTIONS =============
+/**
+ * 🎯 GENERATE SMART PATTERNS - DYNAMIC!
+ */
+function generateSmartPatterns(text) {
+    const patterns = new Set();
+    const cleanText = text.trim().toLowerCase();
+    // 1. Original text
+    patterns.add(cleanText);
+    // 2. Remove punctuation dynamically
+    const noPunct = cleanText.replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ').trim();
+    if (noPunct !== cleanText)
+        patterns.add(noPunct);
+    // 3. Split by common delimiters và lấy parts có nghĩa
+    const delimiters = /[:;,\-|\/\\]/;
+    if (delimiters.test(cleanText)) {
+        cleanText.split(delimiters).forEach(part => {
+            const trimmed = part.trim();
+            if (trimmed.length >= 3) {
+                patterns.add(trimmed);
+            }
+        });
+    }
+    // 4. Word combinations (intelligent)
+    const words = cleanText.split(/\s+/).filter(w => w.length >= 3);
+    if (words.length > 1) {
+        // All individual words
+        words.forEach(word => patterns.add(word));
+        // Adjacent word pairs
+        for (let i = 0; i < words.length - 1; i++) {
+            patterns.add(`${words[i]} ${words[i + 1]}`);
+        }
+        // First + last word (skip middle)
+        if (words.length > 2) {
+            patterns.add(`${words[0]} ${words[words.length - 1]}`);
+        }
+    }
+    return Array.from(patterns).filter(p => p.length >= 3);
+}
+/**
+ * 🎯 FIND BEST MATCH - SMART SIMILARITY CALCULATION
+ */
+function findBestMatch(searchText, line, patterns) {
+    const lowerLine = line.toLowerCase();
+    const lowerSearch = searchText.toLowerCase();
+    let bestScore = 0;
+    let bestPattern = '';
+    // Check exact match first
+    if (lowerLine.includes(lowerSearch)) {
+        return { score: 1.0, pattern: searchText };
+    }
+    // Check each pattern
+    for (const pattern of patterns) {
+        if (lowerLine.includes(pattern)) {
+            // Calculate similarity based on pattern quality
+            let score = calculateSimilarity(lowerSearch, pattern, lowerLine);
+            if (score > bestScore) {
+                bestScore = score;
+                bestPattern = pattern;
+            }
+        }
+    }
+    return { score: bestScore, pattern: bestPattern };
+}
+/**
+ * 📊 CALCULATE SIMILARITY - INTELLIGENT SCORING
+ */
+function calculateSimilarity(searchText, pattern, line) {
+    let score = 0.5; // Base score
+    // Length similarity
+    const lengthRatio = Math.min(pattern.length, searchText.length) / Math.max(pattern.length, searchText.length);
+    score += lengthRatio * 0.2;
+    // Word coverage
+    const searchWords = searchText.split(/\s+/);
+    const patternWords = pattern.split(/\s+/);
+    const coverage = patternWords.length / Math.max(searchWords.length, 1);
+    score += coverage * 0.2;
+    // Context bonuses
+    if (line.includes('fmt.Errorf') || line.includes('errors.New')) {
+        score += 0.1;
+    }
+    if (line.trim().startsWith('return')) {
+        score += 0.05;
+    }
+    // Pattern type bonuses
+    if (pattern === searchText) {
+        score = 1.0; // Perfect match
+    }
+    else if (pattern.length > 5 && searchText.includes(pattern)) {
+        score += 0.15; // Good substring
+    }
+    return Math.min(score, 1.0);
+}
 /**
  * 🔥 TẠO HOVER VỚI ERROR CHAIN BREAKDOWN
  * Đây là function tạo UI cho error chain (có nhiều parts)
@@ -566,8 +696,29 @@ async function showTerminalErrorResults(errorParts, matches) {
         vscode.window.showInformationMessage('💔 No matches found in source code');
         return;
     }
+    // 🔥 FILTER CHỈ LẤY MATCHES ≥ 80%
+    const highQualityMatches = matches.filter(match => {
+        const score = (match.similarity || 0) * 100;
+        return score >= 80; // Chỉ lấy ≥ 80%
+    });
+    console.log(`🎯 Filtered: ${matches.length} total → ${highQualityMatches.length} high quality (≥80%)`);
+    if (highQualityMatches.length === 0) {
+        vscode.window.showInformationMessage(`🤷 Found ${matches.length} matches but none are high quality (≥80%)`);
+        return;
+    }
+    // Sort matches by similarity - cao nhất trước
+    const sortedMatches = highQualityMatches.sort((a, b) => {
+        const scoreA = a.similarity || 0;
+        const scoreB = b.similarity || 0;
+        return scoreB - scoreA; // Descending order
+    });
+    console.log('🏆 High quality matches:');
+    sortedMatches.forEach((match, i) => {
+        const score = ((match.similarity || 0) * 100).toFixed(0);
+        console.log(`  ${i + 1}. ${score}% - ${path.basename(match.file)}:${match.line}`);
+    });
     // Tạo quick pick items
-    const quickPickItems = matches.map((match, index) => {
+    const quickPickItems = sortedMatches.map((match, index) => {
         const relativePath = vscode.workspace.asRelativePath(match.file);
         const description = match.description || 'Match';
         const score = match.similarity ? `(${(match.similarity * 100).toFixed(0)}%)` : '';
@@ -580,7 +731,7 @@ async function showTerminalErrorResults(errorParts, matches) {
     });
     // Hiển thị quick pick menu
     const selected = await vscode.window.showQuickPick(quickPickItems, {
-        placeHolder: `🔍 Found ${matches.length} matches for terminal errors. Select one to navigate:`,
+        placeHolder: `🏆 Found ${sortedMatches.length} high quality matches (≥80%). Select one to navigate:`,
         matchOnDescription: true,
         matchOnDetail: true,
         ignoreFocusOut: true
@@ -650,6 +801,177 @@ async function handleTerminalErrorLink(link) {
         showTerminalErrorResults([errorText], matches);
     }
 }
+// ============= 🔥 EXTERNAL TERMINAL SUPPORT =============
+/**
+ * 🔧 SETUP EXTERNAL TERMINAL SUPPORT
+ */
+function setupExternalTerminalSupport(context) {
+    console.log('🔥 Setting up external terminal support...');
+    // 1. Create status bar item
+    statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
+    statusBarItem.text = '$(search) Go Error Nav';
+    statusBarItem.tooltip = 'Go Error Navigator - Click to toggle clipboard monitoring';
+    statusBarItem.command = 'golang-error-navigator.toggleClipboardMonitoring';
+    statusBarItem.show();
+    // 2. Setup paste detection
+    setupPasteDetection();
+    // 3. Auto-start clipboard monitoring
+    startClipboardMonitoring();
+    // 4. Register status bar item for cleanup
+    context.subscriptions.push(statusBarItem);
+    console.log('✅ External terminal support setup completed!');
+}
+/**
+ * 📋 START CLIPBOARD MONITORING
+ */
+function startClipboardMonitoring() {
+    console.log('📋 Starting clipboard monitoring for external terminal support...');
+    if (clipboardWatcher) {
+        console.log('⚠️ Clipboard monitoring already running');
+        return;
+    }
+    clipboardWatcher = setInterval(async () => {
+        try {
+            const currentClipboard = await vscode.env.clipboard.readText();
+            // Chỉ process nếu clipboard content thay đổi
+            if (currentClipboard !== lastClipboardContent && currentClipboard.trim().length > 0) {
+                lastClipboardContent = currentClipboard;
+                // Check nếu clipboard content chứa Go error patterns
+                if (isGoErrorInClipboard(currentClipboard)) {
+                    console.log('🔍 Go error detected in clipboard!');
+                    await processClipboardError(currentClipboard);
+                }
+            }
+        }
+        catch (error) {
+            console.log('⚠️ Clipboard monitoring error:', error);
+        }
+    }, 1000); // Check mỗi giây
+    // Update status bar
+    statusBarItem.text = '$(search) Go Error Nav $(check)';
+    statusBarItem.tooltip = 'Go Error Navigator - Monitoring ON (Click to toggle)';
+    console.log('✅ Clipboard monitoring started!');
+}
+/**
+ * 🛑 STOP CLIPBOARD MONITORING
+ */
+function stopClipboardMonitoring() {
+    if (clipboardWatcher) {
+        clearInterval(clipboardWatcher);
+        clipboardWatcher = undefined;
+        console.log('📋 Clipboard monitoring stopped');
+        // Update status bar
+        statusBarItem.text = '$(search) Go Error Nav';
+        statusBarItem.tooltip = 'Go Error Navigator - Monitoring OFF (Click to toggle)';
+    }
+}
+/**
+ * 🔄 TOGGLE CLIPBOARD MONITORING
+ */
+function toggleClipboardWatcher() {
+    if (clipboardWatcher) {
+        stopClipboardMonitoring();
+        vscode.window.showInformationMessage('📋 Clipboard monitoring disabled');
+    }
+    else {
+        startClipboardMonitoring();
+        vscode.window.showInformationMessage('📋 Clipboard monitoring enabled');
+    }
+}
+/**
+ * 🔍 CHECK IF CLIPBOARD CONTAINS GO ERROR
+ */
+function isGoErrorInClipboard(text) {
+    // Clean up text
+    const cleanText = text.trim();
+    // Skip if too short (1-2 chars) or too long (crazy long)
+    if (cleanText.length < 1 || cleanText.length > 500) {
+        console.log(`❌ Text too short/long: ${cleanText.length} chars`);
+        return false;
+    }
+    // Skip if it's just numbers or symbols
+    if (/^\d+$/.test(cleanText) || /^[^\w\s]+$/.test(cleanText)) {
+        console.log(`❌ Only numbers or symbols: "${cleanText}"`);
+        return false;
+    }
+    // Skip if it's common non-error stuff
+    const skipPatterns = [
+        /^(yes|no|ok|true|false)$/i,
+        /^(the|and|or|but|with|from|for)$/i,
+        /^[a-z]$/i, // Single letters
+        /^\s*$/ // Just whitespace
+    ];
+    if (skipPatterns.some(pattern => pattern.test(cleanText))) {
+        console.log(`❌ Common word skipped: "${cleanText}"`);
+        return false;
+    }
+    // 🔥 ACCEPT EVERYTHING ELSE!
+    console.log(`✅ Universal detect: "${cleanText.substring(0, 50)}..." → ACCEPTED`);
+    return true;
+}
+/**
+ * 🔧 PROCESS ERROR FROM CLIPBOARD
+ */
+async function processClipboardError(clipboardText) {
+    console.log('🔧 Processing clipboard error:', clipboardText.substring(0, 100) + '...');
+    // Extract error parts using existing function
+    const errorParts = extractErrorsFromTerminalTextWithChainSplit(clipboardText);
+    if (errorParts.length === 0) {
+        console.log('🤷 No error patterns found in clipboard');
+        return;
+    }
+    // Find matches for error parts
+    const allMatches = [];
+    for (const errorPart of errorParts) {
+        const matches = await findAllErrorLocations(errorPart);
+        allMatches.push(...matches);
+    }
+    if (allMatches.length === 0) {
+        console.log('💔 No source locations found for clipboard errors');
+        return;
+    }
+    // Show notification với action
+    const action = await vscode.window.showInformationMessage(`🔍 Found ${allMatches.length} potential matches for Go errors in clipboard!`, 'Show Results', 'Ignore');
+    if (action === 'Show Results') {
+        showTerminalErrorResults(errorParts, allMatches);
+    }
+}
+/**
+ * 🎮 MANUALLY PROCESS CLIPBOARD
+ */
+async function processClipboardManually() {
+    const clipboardText = await vscode.env.clipboard.readText();
+    if (clipboardText.trim().length === 0) {
+        vscode.window.showInformationMessage('📋 Clipboard is empty');
+        return;
+    }
+    if (!isGoErrorInClipboard(clipboardText)) {
+        vscode.window.showInformationMessage('🤷 No Go error patterns found in clipboard');
+        return;
+    }
+    await processClipboardError(clipboardText);
+}
+/**
+ * 🔍 ENHANCED PASTE DETECTION
+ * Detect when user pastes Go error into any VSCode editor
+ */
+function setupPasteDetection() {
+    console.log('📝 Setting up paste detection...');
+    vscode.workspace.onDidChangeTextDocument(event => {
+        const changes = event.contentChanges;
+        for (const change of changes) {
+            // Check if this looks like a paste operation (large text insert)
+            if (change.text.length > 20 && isGoErrorInClipboard(change.text)) {
+                console.log('📝 Go error pasted into editor!');
+                // Auto-trigger error analysis after a short delay
+                setTimeout(async () => {
+                    await processClipboardError(change.text);
+                }, 500);
+            }
+        }
+    });
+    console.log('✅ Paste detection setup completed!');
+}
 // ============= 🧹 CLEANUP FUNCTION =============
 /**
  * 👋 Function được gọi khi extension deactivate
@@ -657,6 +979,13 @@ async function handleTerminalErrorLink(link) {
 function deactivate() {
     console.log('👋 Golang Error Navigator deactivated!');
     console.log('🧹 Cleaning up resources...');
-    // VSCode sẽ tự động cleanup các subscriptions trong context
+    // Stop clipboard monitoring
+    stopClipboardMonitoring();
+    // Hide status bar item
+    if (statusBarItem) {
+        statusBarItem.hide();
+        statusBarItem.dispose();
+    }
+    console.log('✅ Cleanup completed!');
 }
 //# sourceMappingURL=extension.js.map
